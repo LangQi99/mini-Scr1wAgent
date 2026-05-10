@@ -1,0 +1,9 @@
+*
+!/.gitignore
+!/main.py
+!/pyproject.toml
+!/README.md
+!/runner
+!/runner_loop_prompt
+!/uv.lock
+!/.python-version
