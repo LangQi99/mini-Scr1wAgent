@@ -87,6 +87,7 @@ def common_block(args: argparse.Namespace, workspace: Path) -> str:
         "2. 任何题都先判断投入产出比，避免硬刚低收益深坑。",
         "3. 所有关键结论写入共享目录，保证其他 agent 可接手。",
         "4. 找到 flag 候选后立即记录，并通知/交给 submitter 提交。",
+        "5. 如缺少 CTF 常用工具链，先主动搜索是否已有现成工具/脚本可用；必要时可自行安装（例如 ctfskill），但要优先轻量、可复用、可快速验证的方案，并把安装/使用方法写入对应目录笔记。",
         f"平台特性: {platform_rule}",
     ]
     if extra:

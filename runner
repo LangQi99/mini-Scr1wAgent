@@ -1,0 +1,4 @@
+#!/bin/bash
+while true; do
+    cat runner_loop_prompt | coco -c permission_mode=bypass_permissions
+done
