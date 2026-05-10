@@ -1,6 +1,6 @@
 #!/bin/bash
 while true; do
     git pull
-    git reset --hard running
-    cat runner_loop_prompt | coco -c permission_mode=bypass_permissions
+    git reset --hard running-2
+    cat ./runner_loop_prompt > coco -c permission_mode=bypass_permissions
 done
