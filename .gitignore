@@ -7,3 +7,5 @@
 !/runner_loop_prompt
 !/uv.lock
 !/.python-version
+!/runner2
+!/runner_loop_prompt2

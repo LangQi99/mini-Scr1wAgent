@@ -1,10 +1,9 @@
 #!/bin/bash
-script_dir="$(cd "$(dirname "$0")" && pwd)"
+script_dir="$PWD"
 prompt_file="$script_dir/runner_loop_prompt"
 
 while true; do
-    # git pull
-    # git reset --hard running-2
-    
+    git pull
+    git reset --hard running-3
     coco -c permission_mode=bypass_permissions -p "$(cat "$prompt_file")"
 done

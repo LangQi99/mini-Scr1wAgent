@@ -1,8 +1,13 @@
-使用./main.py这个强力的工具 进行ctf比赛 uv run main.py
+请使用subagent
 
+上来使用uv run main.py
 
-账号密码：
+账号密码：123/123
 
-比赛地址是：
+比赛地址是：http://localhost:8000/login
 
 开始！！！
+
+你监控着main.py就行
+
+想办法让我拿第一名ctf 多多帮我使用subagent完成任务

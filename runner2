@@ -1,0 +1,9 @@
+#!/bin/bash
+script_dir="$PWD"
+prompt_file2="$script_dir/runner_loop_prompt2"
+
+while true; do
+    mkdir -p $script_dir/tmp-agent
+    cd $script_dir/tmp-agent    
+    coco -c permission_mode=bypass_permissions -p "$(cat "$prompt_file2")"
+done

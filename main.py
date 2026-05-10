@@ -5,9 +5,12 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TextIO
 
 
 PRESET_SOLVERS = {
@@ -22,6 +25,7 @@ PLATFORM_RULES = {
 }
 
 REQUIRED_PERMISSION_MODE = "bypass_permissions"
+STATUS_PREVIEW_LIMIT = 120
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,27 @@ class LaunchSpec:
     resume_prompt: str
 
 
+class AgentStatusBoard:
+    def __init__(self, specs: list[LaunchSpec]) -> None:
+        self._lock = threading.Lock()
+        self._statuses = {spec.name: "已启动，等待首条消息" for spec in specs}
+
+    def update(self, agent_name: str, status: str, *, force: bool = False) -> None:
+        status = truncate_text(status)
+        with self._lock:
+            if not force and self._statuses.get(agent_name) == status:
+                return
+            self._statuses[agent_name] = status
+            print(f"[{timestamp()}] [{agent_name}] {status}", flush=True)
+
+    def snapshot(self) -> None:
+        with self._lock:
+            print(f"[{timestamp()}] [ctfagent] 当前 agent 状态快照（{len(self._statuses)} 个）:", flush=True)
+            for agent_name, status in self._statuses.items():
+                print(f"  - {agent_name}: {status}", flush=True)
+            print(flush=True)
+
+
 def slugify(value: str) -> str:
     cleaned = []
     for char in value.strip().lower():
@@ -46,6 +71,105 @@ def slugify(value: str) -> str:
     while "--" in slug:
         slug = slug.replace("--", "-")
     return slug.strip("-") or "task"
+
+
+def timestamp() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def truncate_text(text: str, limit: int = STATUS_PREVIEW_LIMIT) -> str:
+    normalized = normalize_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
+
+
+def extract_text(value: Any, *, limit: int = STATUS_PREVIEW_LIMIT) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return truncate_text(value, limit)
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = extract_text(item, limit=limit)
+            if text:
+                parts.append(text)
+            if len(" | ".join(parts)) >= limit:
+                break
+        return truncate_text(" | ".join(parts), limit)
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "delta", "result", "summary", "description", "reason", "error", "value"):
+            text = extract_text(value.get(key), limit=limit)
+            if text:
+                return text
+        if value.get("type") in {"tool_use", "function_call", "tool_call"}:
+            tool_name = value.get("name") or value.get("tool_name") or value.get("recipient_name")
+            if tool_name:
+                return f"调用工具 {tool_name}"
+        for nested in value.values():
+            text = extract_text(nested, limit=limit)
+            if text:
+                return text
+        return ""
+    return truncate_text(str(value), limit)
+
+
+def summarize_stream_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        event_type = payload.get("type") or payload.get("event") or payload.get("kind")
+        status = payload.get("status")
+        tool_name = payload.get("name") or payload.get("tool_name") or payload.get("recipient_name")
+
+        if tool_name and (
+            event_type in {"tool_use", "function_call", "tool_call", "tool"}
+            or payload.get("tool_input") is not None
+            or payload.get("arguments") is not None
+        ):
+            return truncate_text(f"调用工具 {tool_name}")
+
+        if payload.get("error") is not None or (isinstance(event_type, str) and event_type.endswith("error")):
+            detail = extract_text(payload.get("error") or payload)
+            return truncate_text(f"错误: {detail}" if detail else "发生错误")
+
+        if status and event_type:
+            detail = extract_text(payload.get("message") or payload.get("content") or payload.get("result") or payload.get("delta"))
+            if detail:
+                return truncate_text(f"{event_type}/{status}: {detail}")
+            return truncate_text(f"{event_type}/{status}")
+
+        if payload.get("role") == "assistant" or event_type in {"assistant", "assistant_message", "message"}:
+            detail = extract_text(payload.get("message") or payload.get("content") or payload.get("delta") or payload)
+            if detail:
+                return detail
+
+        detail = extract_text(payload)
+        if event_type and detail and detail != event_type:
+            return truncate_text(f"{event_type}: {detail}")
+        if detail:
+            return detail
+        if event_type:
+            return truncate_text(str(event_type))
+        return ""
+
+    return extract_text(payload)
+
+
+def summarize_stream_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("[ctfagent-supervisor]"):
+        return stripped
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return truncate_text(stripped)
+    return summarize_stream_payload(payload)
 
 
 def default_workspace() -> Path:
@@ -374,7 +498,75 @@ def continuous_shell_command(spec: LaunchSpec, args: argparse.Namespace) -> str:
     return "\n".join(lines)
 
 
-def launch_subprocess(spec: LaunchSpec, args: argparse.Namespace) -> None:
+def monitor_stream(stream: TextIO, log_file: TextIO, spec: LaunchSpec, board: AgentStatusBoard, *, source: str) -> None:
+    for raw_line in stream:
+        log_file.write(raw_line)
+        log_file.flush()
+        summary = summarize_stream_line(raw_line)
+        if not summary:
+            continue
+        if source == "stderr":
+            summary = truncate_text(f"stderr: {summary}")
+        board.update(spec.name, summary)
+
+
+def watch_process(process: subprocess.Popen[str], spec: LaunchSpec, stdout_path: Path, stderr_path: Path, board: AgentStatusBoard) -> list[threading.Thread]:
+    threads: list[threading.Thread] = []
+    with stdout_path.open("a", encoding="utf-8") as stdout_log, stderr_path.open("a", encoding="utf-8") as stderr_log:
+        if process.stdout is not None:
+            stdout_thread = threading.Thread(
+                target=monitor_stream,
+                args=(process.stdout, stdout_log, spec, board),
+                kwargs={"source": "stdout"},
+                daemon=True,
+            )
+            stdout_thread.start()
+            threads.append(stdout_thread)
+        if process.stderr is not None:
+            stderr_thread = threading.Thread(
+                target=monitor_stream,
+                args=(process.stderr, stderr_log, spec, board),
+                kwargs={"source": "stderr"},
+                daemon=True,
+            )
+            stderr_thread.start()
+            threads.append(stderr_thread)
+        process.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+    board.update(spec.name, f"已退出，exit={process.returncode}", force=True)
+    return threads
+
+
+def print_launch_banner(specs: list[LaunchSpec], workspace: Path) -> None:
+    print(f"[{timestamp()}] [ctfagent] 启动 {len(specs)} 个 agent，workspace={workspace}", flush=True)
+    for spec in specs:
+        print(f"[{timestamp()}] [ctfagent] {spec.name}: role={spec.role} affinity={spec.affinity} cwd={spec.cwd}", flush=True)
+    print(flush=True)
+
+
+def watch_processes(processes: list[tuple[LaunchSpec, subprocess.Popen[str], Path, Path]], board: AgentStatusBoard, status_interval: int) -> int:
+    watcher_threads: list[threading.Thread] = []
+    for spec, process, stdout_path, stderr_path in processes:
+        thread = threading.Thread(
+            target=watch_process,
+            args=(process, spec, stdout_path, stderr_path, board),
+            daemon=True,
+        )
+        thread.start()
+        watcher_threads.append(thread)
+
+    while any(thread.is_alive() for thread in watcher_threads):
+        board.snapshot()
+        time.sleep(max(status_interval, 1))
+
+    for thread in watcher_threads:
+        thread.join(timeout=1)
+    board.snapshot()
+    return 0
+
+
+def launch_subprocess(spec: LaunchSpec, args: argparse.Namespace) -> tuple[subprocess.Popen[str], Path, Path]:
     ensure_dirs([spec.cwd])
     stdout_path = spec.cwd / "agent.stdout.log"
     stderr_path = spec.cwd / "agent.stderr.log"
@@ -382,8 +574,15 @@ def launch_subprocess(spec: LaunchSpec, args: argparse.Namespace) -> None:
         cmd = ["/bin/sh", "-lc", continuous_shell_command(spec, args)]
     else:
         cmd = coco_command(spec, args, interactive=False)
-    with stdout_path.open("a", encoding="utf-8") as stdout, stderr_path.open("a", encoding="utf-8") as stderr:
-        subprocess.Popen(cmd, cwd=spec.cwd, stdout=stdout, stderr=stderr)
+    process = subprocess.Popen(
+        cmd,
+        cwd=spec.cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    return process, stdout_path, stderr_path
 
 
 def launch_terminal(spec: LaunchSpec, args: argparse.Namespace) -> None:
@@ -443,11 +642,20 @@ def handle_launch_match(args: argparse.Namespace) -> int:
                 print(quote_command(cmd))
             print()
         return 0
-    launcher = launch_terminal if args.executor == "terminal" else launch_subprocess
+    print_launch_banner(specs, workspace)
+    if args.executor == "terminal":
+        for spec in specs:
+            launch_terminal(spec, args)
+            print(f"launched {spec.name} -> {spec.cwd}")
+        return 0
+
+    board = AgentStatusBoard(specs)
+    processes: list[tuple[LaunchSpec, subprocess.Popen[str], Path, Path]] = []
     for spec in specs:
-        launcher(spec, args)
-        print(f"launched {spec.name} -> {spec.cwd}")
-    return 0
+        process, stdout_path, stderr_path = launch_subprocess(spec, args)
+        board.update(spec.name, f"已启动，pid={process.pid}", force=True)
+        processes.append((spec, process, stdout_path, stderr_path))
+    return watch_processes(processes, board, args.status_interval)
 
 
 def handle_launch_challenge(args: argparse.Namespace) -> int:
@@ -465,11 +673,20 @@ def handle_launch_challenge(args: argparse.Namespace) -> int:
                 print(quote_command(cmd))
             print()
         return 0
-    launcher = launch_terminal if args.executor == "terminal" else launch_subprocess
+    print_launch_banner(specs, workspace)
+    if args.executor == "terminal":
+        for spec in specs:
+            launch_terminal(spec, args)
+            print(f"launched {spec.name} -> {spec.cwd}")
+        return 0
+
+    board = AgentStatusBoard(specs)
+    processes: list[tuple[LaunchSpec, subprocess.Popen[str], Path, Path]] = []
     for spec in specs:
-        launcher(spec, args)
-        print(f"launched {spec.name} -> {spec.cwd}")
-    return 0
+        process, stdout_path, stderr_path = launch_subprocess(spec, args)
+        board.update(spec.name, f"已启动，pid={process.pid}", force=True)
+        processes.append((spec, process, stdout_path, stderr_path))
+    return watch_processes(processes, board, args.status_interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -482,6 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-timeout", default="20m", help="coco 单次 query 超时")
     parser.add_argument("--bash-timeout", default="10m", help="coco bash tool 超时")
     parser.add_argument("--loop-interval", type=int, default=8, help="continuous 模式下每轮重启前 sleep 秒数")
+    parser.add_argument("--status-interval", type=int, default=15, help="subprocess 模式下打印 agent 状态快照的秒数")
     parser.add_argument("--extra-context", default="", help="追加到所有 agent prompt 的额外上下文")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
